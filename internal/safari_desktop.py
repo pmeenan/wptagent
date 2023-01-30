@@ -42,21 +42,25 @@ class SafariDesktop(DesktopBrowser):
         self.must_exit_now = False
         self.page = {}
         self.requests = {}
+        self.request_details = {}
         self.connections = {}
         self.request_count = 0
         self.total_sleep = 0
         self.long_tasks = []
+        self.valid_pages = []
         self.last_activity = monotonic()
         self.script_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'js')
         self.start_page = 'http://127.0.0.1:8888/orange.html'
         self.safari_log = None
         self.safari_log_thread = None
         self.stop_safari_log = False
-        self.events = multiprocessing.JoinableQueue()
         self.re_content_resource = re.compile(r'^[^\[]*\[[^\]]*frameID=(?P<frame>\d+)[^\]]*resourceID=(?P<resource>\d+)[^\]]*\] (?P<msg>.*)$')
+        self.re_page_id = re.compile(r'^[^\[]*\[[^\]]*webPageID=(?P<page>\d+)[^\]]*')
+        self.re_content_page_id = re.compile(r'^[^\[]*\[[^\]]*pageID=(?P<page>\d+)[^\]]*')
         self.re_net_task = re.compile(r'Task (?P<task><[^>]+>\.<[^>]+>)')
         self.re_net_connection = re.compile(r'Connection (?P<connection>\d+)')
-        self.re_connection = re.compile(r' \[C(?P<connection>\d+)')
+        self.re_connection = re.compile(r'\[C(?P<connection>\d+)')
+        self.re_host = re.compile(r'\[C(?P<connection>\d+)[^ ]* (?P<host>[^: ]+):(?P<port>\d+)')
         self.re_parens = re.compile(r'\(([^\)]+)\)')
         self.re_curley = re.compile(r'\{([^\}]+)\}')
         self.tasks = {}
@@ -66,6 +70,7 @@ class SafariDesktop(DesktopBrowser):
         """Prepare the profile/OS for the browser"""
         self.page = {}
         self.requests = {}
+        self.request_details = {}
         self.request_count = 0
         self.start_time = None
         # Manually kill Safari gracefully here because DesktopBrowser will try a SIGTERM which doesn't work
@@ -224,7 +229,7 @@ class SafariDesktop(DesktopBrowser):
 
     def wait_for_page_load(self):
         """Wait for the onload event from the extension"""
-        if self.driver:
+        if self.job['message_server'] is not None and self.driver:
             logging.debug('Waiting for page load')
             start_time = monotonic()
             end_time = start_time + self.task['time_limit']
@@ -236,8 +241,8 @@ class SafariDesktop(DesktopBrowser):
                 if self.page_loaded is not None:
                     interval = 0.1
                 try:
-                    event = self.get_event(interval)
-                    self.process_event(event)
+                    message = self.job['message_server'].get_message(interval)
+                    self.process_message(message)
                 except Exception:
                     # ignore timeouts when we're in a polling read loop
                     pass
@@ -405,8 +410,10 @@ class SafariDesktop(DesktopBrowser):
     def on_start_recording(self, task):
         """Notification that we are about to start an operation that needs to be recorded"""
         # Clear the state
+        self.flush_messages()
         self.page = {}
         self.requests = {}
+        self.request_details = {}
         self.long_tasks = []
         task['page_data'] = {'date': time.time()}
         task['page_result'] = None
@@ -420,7 +427,6 @@ class SafariDesktop(DesktopBrowser):
             self.last_activity = now
         if self.page_loaded is not None:
             self.page_loaded = now
-        self.flush_pending_events()
         DesktopBrowser.on_start_recording(self, task)
         logging.debug('Starting measurement')
         task['start_time'] = datetime.utcnow()
@@ -659,6 +665,9 @@ class SafariDesktop(DesktopBrowser):
             try:
                 req = self.requests[req_id]
                 if req['from_net'] and 'start' in req:
+                    # Find the matching request details from the extension for the request
+                    details = {}
+
                     # Generate a bogus URL for the request
                     proto = 'http'
                     if 'socket' in req and req['socket'] in self.connections and 'tls_start' in self.connections[req['socket']]:
@@ -667,9 +676,15 @@ class SafariDesktop(DesktopBrowser):
                         req['url'] = '{}://{}/{}'.format(proto, req['socket'], req_id)
                     else:
                         req['url'] = '{}://{}/'.format(proto, req_id)
+                    if 'url' in details:
+                        req['url'] = details['url']
                     request = self.get_empty_request(req['id'], req['url'])
                     if 'status' in req:
                         request['responseCode'] = req['status']
+                    elif 'status' in details:
+                        request['responseCode'] = details['status']
+                    if 'method' in details:
+                        request['method'] = details['method']
                     request['created'] = int(round(req['created'] * 1000.0))
                     request['load_start'] = int(round(req['start'] * 1000.0))
                     request['startTime'] = req['start'] * 1000.0
@@ -690,6 +705,24 @@ class SafariDesktop(DesktopBrowser):
                         request['bytesOut'] = req['bytes_out']
                     if 'bytes_in_uncompressed' in req:
                         request['objectSizeUncompressed'] = req['bytes_in_uncompressed']
+                    if 'request_headers' in details:
+                        for header in details['request_headers']:
+                            if 'name' in header and 'value' in header:
+                                header_text = '{0}: {1}'.format(header['name'], header['value'])
+                                request['bytesOut'] += len(header_text) + 2
+                                request['headers']['request'].append(header_text)
+                    if 'status_line' in details:
+                        request['bytesIn'] += len(details['status_line']) + 2
+                        request['headers']['response'].append(details['status_line'])
+                    if 'response_headers' in details:
+                        for header in details['response_headers']:
+                            if 'name' in header and 'value' in header:
+                                try:
+                                    header_text = '{0}: {1}'.format(header['name'], header['value'])
+                                    request['bytesIn'] += len(header_text) + 2
+                                    request['headers']['response'].append(header_text)
+                                except Exception:
+                                    logging.exception('Error appending response header')
                     # Add the connection timings
                     if 'socket' in req and req['socket'] in self.connections:
                         conn = self.connections[req['socket']]
@@ -708,6 +741,8 @@ class SafariDesktop(DesktopBrowser):
                             if 'tls_end' in conn and conn['tls_end'] >= 0:
                                 request['ssl_end'] = int(round(conn['tls_end'] * 1000.0))
                     requests.append(request)
+                else:
+                    logging.debug('Skipping request %s - missing start or not from net: %s', req_id, json.dumps(req))
             except Exception:
                 logging.error('Error merging request')
         requests.sort(key=lambda x: x['startTime'] if 'startTime' in x else 0)
@@ -786,88 +821,118 @@ class SafariDesktop(DesktopBrowser):
         self.task['page_result'] = page['result']
         return page
 
-    def process_event(self, event):
+    def process_message(self, message):
         """ Process and individual event """
-        # Use the timestamp from the first log event as the start time base if
-        # we are not doing the first page load
-        if self.start_time is None and self.page_loaded is not None:
-            self.start_time = event['ts']
+        try:
+            if 'path' in message:
+                if message['path'] == 'log':
+                    # Use the timestamp from the first log event as the start time base if
+                    # we are not doing the first page load
+                    if self.start_time is None and self.page_loaded is not None:
+                        self.start_time = message['ts']
 
-        # Process the actual event
-        if event['proc'] == 'Safari':
-            self.process_safari_event(event)
-        elif event['proc'] == 'com.apple.WebKit.Networking':
-            self.process_network_event(event)
-        elif event['proc'] == 'com.apple.WebKit.WebContent':
-            self.process_content_event(event)
+                    # Process the actual event
+                    if message['proc'] == 'Safari':
+                        self.process_safari_event(message)
+                    elif message['proc'] == 'com.apple.WebKit.Networking':
+                        self.process_network_event(message)
+                    elif message['proc'] == 'com.apple.WebKit.WebContent':
+                        self.process_content_event(message)
+                elif 'body' in message and self.recording:
+                    if message['path'].startswith('webRequest.'):
+                        self.process_web_request_event(message['path'], message['body'])
+        except Exception:
+            logging.exception('Error processing message: %s', message)
 
     def process_safari_event(self, event):
         """Process 'Safari' process events"""
         msg = event['msg']
-        if event['cat'] == 'Loading' and msg.find('isMainFrame=1') >= 0:
+        if self.recording and event['cat'] == 'Loading' and msg.find('isMainFrame=1') >= 0:
+            page_search = self.re_page_id.search(msg)
+            page = None
+            if page_search is not None:
+                page = page_search.group('page')
             if msg.find('didStartProvisionalLoadForFrame') >= 0:
+                if page is not None and page not in self.valid_pages:
+                    self.valid_pages.append(page)
                 self.page_loaded = None
                 if self.start_time is None:
                     self.start_time = event['ts']
                 ts = max(.0, event['ts'] - self.start_time)
-                logging.debug('%0.6f ***** Safari page load start', ts)
+                logging.debug('%0.6f ***** Safari page load start (page %s)', ts, page)
             elif msg.find('didFinishLoadForFrame') >= 0:
+                if page is not None and page not in self.valid_pages:
+                    self.valid_pages.append(page)
                 if self.start_time is None:
                     self.start_time = event['ts']
                 ts = max(.0, event['ts'] - self.start_time)
                 self.page['loaded'] = ts
                 self.page_loaded = monotonic()
-                logging.debug('%0.6f ***** Safari page load done', ts)
+                logging.debug('%0.6f ***** Safari page load done (page %s)', ts, page)
 
     def process_network_event(self, event):
         """Process 'com.apple.WebKit.Networking' process events"""
         msg = event['msg']
         if event['cat'] in ['boringssl', 'connection']:
-            if self.start_time is None:
-                self.start_time = event['ts']
-            ts = max(.0, event['ts'] - self.start_time)
+            # extract connection host information independent of recording state
+            conn = None
             connection_search = self.re_connection.search(event['msg'])
             connection = connection_search.group('connection') if connection_search else None
             if connection is not None:
                 if connection not in self.connections:
-                    self.connections[connection] = {'claimed': False}
+                    self.connections[connection] = {'id': connection, 'claimed': False}
                 conn = self.connections[connection]
-                id = conn['request'] if 'request' in conn else ''
-                if event['cat'] == 'boringssl':
-                    if 'start' not in conn:
-                        conn['start'] = ts
-                    if 'tls_start' not in conn:
-                        conn['end'] = ts
-                        conn['tls_start'] = ts
-                        logging.debug('%0.6f %s: Connection %s TLS started', ts, id, connection)
-                    if 'tls_end' not in conn and msg.find('Client handshake done') >= 0:
-                        conn['tls_end'] = ts
-                        logging.debug('%0.6f %s: Connection %s TLS complete', ts, id, connection)
-                elif event['cat'] == 'connection':
-                    if 'dns_start' not in conn and msg.find('Starting host resolution') >= 0:
-                        conn['dns_start'] = ts
-                        logging.debug('%0.6f %s (connection): DNS Lookup started', ts, id)
-                    if 'dns_end' not in conn and msg.find('Got DNS result') >= 0:
-                        conn['dns_end'] = ts
-                        if 'start' in conn:
+                if 'host' not in conn:
+                    host_search = self.re_host.search(event['msg'])
+                    if host_search is not None:
+                        conn['host'] = host_search.group('host')
+                        conn['port'] = host_search.group('port')
+            if self.recording:
+                if self.start_time is None:
+                    self.start_time = event['ts']
+                ts = max(.0, event['ts'] - self.start_time)
+                if conn is not None:
+                    id = conn['request'] if 'request' in conn else ''
+                    if event['cat'] == 'boringssl':
+                        if 'start' not in conn:
                             conn['start'] = ts
-                        logging.debug('%0.6f %s (connection): DNS Lookup complete', ts, id)
-        else:
+                        if 'tls_start' not in conn:
+                            conn['end'] = ts
+                            conn['tls_start'] = ts
+                            logging.debug('%0.6f %s: Connection %s TLS started', ts, id, connection)
+                        if 'tls_end' not in conn and msg.find('Client handshake done') >= 0:
+                            conn['tls_end'] = ts
+                            logging.debug('%0.6f %s: Connection %s TLS complete', ts, id, connection)
+                    elif event['cat'] == 'connection':
+                        if 'dns_start' not in conn and msg.find('Starting host resolution') >= 0:
+                            conn['dns_start'] = ts
+                            logging.debug('%0.6f %s (connection): DNS Lookup started', ts, id)
+                        if 'dns_end' not in conn and msg.find('Got DNS result') >= 0:
+                            conn['dns_end'] = ts
+                            if 'start' in conn:
+                                conn['start'] = ts
+                            logging.debug('%0.6f %s (connection): DNS Lookup complete', ts, id)
+        elif self.recording:
             res = self.re_content_resource.match(event['msg'])
             task_search = self.re_net_task.search(event['msg'])
             task = task_search.group('task') if task_search else None
             connection_search = self.re_net_connection.search(event['msg'])
             connection = connection_search.group('connection') if connection_search else None
             id = None
+            page = None
             if res:
-                id = '{}.{}'.format(res.group('frame'), res.group('resource'))
-                msg = res.group('msg')
-                if task and task not in self.tasks:
-                    self.tasks[task] = id
+                page_search = self.re_page_id.search(event['msg'])
+                if page_search is not None:
+                    page = page_search.group('page')
+                    if page in self.valid_pages:
+                        id = '{}.{}.{}'.format(page, res.group('frame'), res.group('resource'))
+                        msg = res.group('msg')
+                        if task and task not in self.tasks:
+                            self.tasks[task] = id
             elif task and task in self.tasks:
                 id = self.tasks[task]
             # Only process network events where we have a resource ID
-            if id:
+            if id is not None:
                 self.last_activity = monotonic()
                 if self.start_time is None:
                     self.start_time = event['ts']
@@ -880,7 +945,9 @@ class SafariDesktop(DesktopBrowser):
                     self.request_count += 1
                 request = self.requests[id]
                 if connection is not None:
-                    request['socket'] = connection
+                    if 'socket' not in request:
+                        logging.debug('%0.6f %s (Net): Request assigned to connection %s', ts, id, connection)
+                        request['socket'] = connection
                     if connection not in self.connections:
                         self.connections[connection] = {'claimed': False}
                     conn = self.connections[connection]
@@ -919,38 +986,44 @@ class SafariDesktop(DesktopBrowser):
 
     def process_content_event(self, event):
         """Process 'com.apple.WebKit.WebContent' process events"""
-        if event['sender'] in ['CoreFoundation', 'SkyLight', 'LaunchServices', 'AppKit']:
+        if not self.recording or event['sender'] in ['CoreFoundation', 'SkyLight', 'LaunchServices', 'AppKit']:
             return
         res = self.re_content_resource.match(event['msg'])
         # Only process content events where we have a resource ID
         if res:
-            if self.start_time is None:
-                self.start_time = event['ts']
-            ts = max(.0, event['ts'] - self.start_time)
-            id = '{}.{}'.format(res.group('frame'), res.group('resource'))
-            msg = res.group('msg')
-            if id not in self.requests:
-                self.requests[id] = {'id': id,
-                                     'created': ts,
-                                     'url': 'https://' + id,
-                                     'from_net': True}
-            request = self.requests[id]
-            if msg.find('WebLoaderStrategy::scheduleLoad') >= 0:
-                # Parse any details that are available
-                values_search = self.re_parens.search(event['msg'])
-                if values_search:
-                    values = values_search.group(1)
-                    self.parse_response_values(request, ts, values)
-            elif msg.find('WebResourceLoader::didReceiveResponse') >= 0:
-                if 'first_byte' not in request:
-                    request['first_byte'] = ts
-                request['end'] = ts
-                # Parse any details that are available
-                values_search = self.re_parens.search(event['msg'])
-                if values_search:
-                    values = values_search.group(1)
-                    self.parse_response_values(request, ts, values)
-            logging.debug('%0.6f %s (Content): %s', ts, id, msg)
+            page_search = self.re_page_id.search(event['msg'])
+            if page_search is None:
+                page_search = self.re_content_page_id.search(event['msg'])
+            if page_search is not None:
+                page = page_search.group('page')
+                if page in self.valid_pages:
+                    if self.start_time is None:
+                        self.start_time = event['ts']
+                    ts = max(.0, event['ts'] - self.start_time)
+                    id = '{}.{}.{}'.format(page, res.group('frame'), res.group('resource'))
+                    msg = res.group('msg')
+                    if id not in self.requests:
+                        self.requests[id] = {'id': id,
+                                            'created': ts,
+                                            'url': 'https://' + id,
+                                            'from_net': True}
+                    request = self.requests[id]
+                    if msg.find('WebLoaderStrategy::scheduleLoad') >= 0:
+                        # Parse any details that are available
+                        values_search = self.re_parens.search(event['msg'])
+                        if values_search:
+                            values = values_search.group(1)
+                            self.parse_response_values(request, ts, values)
+                    elif msg.find('WebResourceLoader::didReceiveResponse') >= 0:
+                        if 'first_byte' not in request:
+                            request['first_byte'] = ts
+                        request['end'] = ts
+                        # Parse any details that are available
+                        values_search = self.re_parens.search(event['msg'])
+                        if values_search:
+                            values = values_search.group(1)
+                            self.parse_response_values(request, ts, values)
+                    logging.debug('%0.6f %s (Content): %s', ts, id, msg)
 
     def parse_response_values(self, request, ts, values):
         """ Tokenize a set of response values """
@@ -982,45 +1055,59 @@ class SafariDesktop(DesktopBrowser):
                         if value == 'true':
                             request['from_net'] = False
                     elif key == 'connection':
-                        request['socket'] = value
+                        if 'socket' not in request:
+                            request['socket'] = value
                     elif key == 'response_status':
                         request['status'] = int(value)
             except Exception:
                 logging.exception('Error processing response token')
 
-    def get_event(self, timeout):
-        """Wait for and return an event from the queue"""
-        event = None
-        try:
-            if timeout is None or timeout <= 0:
-                event = self.events.get_nowait()
-            else:
-                event = self.events.get(True, timeout)
-            self.events.task_done()
-        except Exception:
-            pass
-        return event
-
-    def flush_pending_events(self):
-        """Clear out any pending events"""
-        try:
-            while True:
-                self.events.get_nowait()
-                self.events.task_done()
-        except Exception:
-            pass
+    def process_web_request_event(self, name, details):
+        if 'frameId' in details and 'requestId' in details:
+            id = '{}.{}'.format(details['frameId'], details['requestId'])
+            logging.debug('%s (%s): %s', id, name, json.dumps(details))
+            if id not in self.request_details:
+                self.request_details[id] = {'id': id}
+            request = self.request_details[id]
+            if 'url' in details and details['url'] is not None and 'url' not in request:
+                request['url'] = details['url']
+            if 'method' in details and details['method'] is not None and 'method' not in request:
+                request['method'] = details['method']
+            if 'fromCache' in details and details['fromCache']:
+                request['from_net'] = False
+            if 'statusLine' in details and details['statusLine'] is not None:
+                request['status_line'] = details['statusLine']
+            if 'statusCode' in details and details['statusCode'] is not None:
+                request['status'] = details['statusCode']
+            if 'requestHeaders' in details and details['requestHeaders'] is not None and \
+                    'request_headers' not in request:
+                request['request_headers'] = list(details['requestHeaders'])
+            if 'responseHeaders' in details and details['responseHeaders'] is not None and \
+                    'response_headers' not in request:
+                request['response_headers'] = list(details['responseHeaders'])
 
     def wait_for_events_idle(self):
         """ Wait for there to be a 1 second gap in log events or up to 30 seconds max """
         logging.debug('Waiting for Safari to go idle...')
-        end = monotonic() + 30
-        try:
-            while monotonic() < end:
-                self.events.get(True, 1)
-                self.events.task_done()
-        except Exception:
-            pass
+        if self.job['message_server'] is not None:
+            end = monotonic() + 30
+            try:
+                while monotonic() < end:
+                    message = self.job['message_server'].get_message(1)
+                    self.process_message(message)
+            except Exception:
+                pass
         logging.debug('Done waiting for Safari to go idle.')
+
+    def flush_messages(self):
+        """ Flush any pending messages (but process them to extract connection information) """
+        if self.job['message_server'] is not None:
+            try:
+                while True:
+                    message = self.job['message_server'].get_message(0)
+                    self.process_message(message)
+            except Exception:
+                pass
 
     def pump_safari_log_output(self):
         """ Background thread for reading and processing log output """
@@ -1049,6 +1136,7 @@ class SafariDesktop(DesktopBrowser):
                                     start_time = ts
                                 elapsed = ts - start_time
                                 event = {
+                                    'path': 'log',
                                     'proc': os.path.basename(raw['processImagePath']),
                                     'sender': os.path.basename(raw['senderImagePath']),
                                     'subsystem': raw['subsystem'],
@@ -1058,7 +1146,8 @@ class SafariDesktop(DesktopBrowser):
                                 }
                                 # Filter out a bunch of noise
                                 if event['sender'] in ['Safari', 'WebKit'] or event['proc'] != 'Safari' :
-                                    self.events.put(event)
+                                    if self.job is not None and self.job['message_server'] is not None:
+                                        self.job['message_server'].handle_message(event)
                         except Exception:
                             logging.exception('Error parsing log event')
                     else:
